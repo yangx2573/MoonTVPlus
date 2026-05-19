@@ -12396,7 +12396,7 @@ const OPDSConfigComponent = ({
         <h3 className='mb-2 text-sm font-medium text-amber-900 dark:text-amber-100'>关于电子书馆 / OPDS / Legado</h3>
         <div className='space-y-1 text-sm text-amber-800 dark:text-amber-200'>
           <p>• OPDS 源手动配置。</p>
-          <p>• Legado 通过订阅 URL 导入，完整书源内容独立存储，不写入 admin_config。</p>
+          <p>• Legado 通过订阅 URL 导入。</p>
         </div>
       </div>
 

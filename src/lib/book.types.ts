@@ -25,6 +25,7 @@ export interface LegadoRuleSearch {
 export type LegadoRuleExplore = LegadoRuleSearch;
 
 export interface LegadoRuleBookInfo {
+  init?: string;
   name?: string;
   author?: string;
   intro?: string;
@@ -52,6 +53,7 @@ export interface LegadoRuleContent {
   nextContentUrl?: string;
   imageStyle?: string;
   sourceRegex?: string;
+  replaceRegex?: string;
   payAction?: string;
 }
 

@@ -19,6 +19,7 @@ import {
   BookSource,
   BookSourceCapabilities,
   LegadoBookSourceRule,
+  LegadoRuleSearch,
 } from './book.types';
 import { validateProxyUrlServerSide } from './server/ssrf';
 import { legadoSubscriptionStore } from './legado/subscription-store';
@@ -31,7 +32,6 @@ interface ResolvedLegadoConfig {
 
 const DEFAULT_TIMEOUT_MS = Number(process.env.LEGADO_TIMEOUT_MS || process.env.OPDS_TIMEOUT_MS || 20000);
 const MAX_TEXT_BYTES = Number(process.env.LEGADO_MAX_TEXT_BYTES || 3 * 1024 * 1024);
-const LEGADO_CACHE_VERSION = 'v5';
 const DEFAULT_LEGADO_SEARCH_PAGES = Number(process.env.LEGADO_SEARCH_PAGES || 5);
 const textCache = new Map<string, { expiresAt: number; data: string }>();
 const searchCache = new Map<string, { expiresAt: number; data: BookListItem[] }>();
@@ -56,16 +56,27 @@ function stableId(input: string) {
   return crypto.createHash('sha1').update(input).digest('hex').slice(0, 16);
 }
 
-function asObjectHeader(value?: string | Record<string, string>): Record<string, string> {
+function isSafeHeaderName(name: string) {
+  return /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(name);
+}
+
+function asObjectHeader(value?: string | Record<string, string>, context?: Record<string, any>): Record<string, string> {
   if (!value) return {};
   if (typeof value === 'object') return value;
+  let raw = value.trim();
+  if (raw.startsWith('@js:')) {
+    raw = runJsSnippet(raw, context || {});
+  }
   try {
-    const parsed = JSON.parse(value);
+    const parsed = JSON.parse(raw);
     return parsed && typeof parsed === 'object' ? parsed : {};
   } catch {
-    return value.split('\n').reduce<Record<string, string>>((headers, line) => {
+    return raw.split('\n').reduce<Record<string, string>>((headers, line) => {
       const index = line.indexOf(':');
-      if (index > 0) headers[line.slice(0, index).trim()] = line.slice(index + 1).trim();
+      if (index > 0) {
+        const name = line.slice(0, index).trim();
+        if (isSafeHeaderName(name)) headers[name] = line.slice(index + 1).trim();
+      }
       return headers;
     }, {});
   }
@@ -73,10 +84,11 @@ function asObjectHeader(value?: string | Record<string, string>): Record<string,
 
 function buildHeaders(source: BookSource): HeadersInit {
   const rule = source.legado;
+  const baseUrl = sourceBase(source);
   const headers: Record<string, string> = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36',
     Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    ...asObjectHeader(rule?.header),
+    ...asObjectHeader(rule?.header, { baseUrl, source: rule }),
   };
   if (source.authMode === 'header' && source.headerName && source.headerValue) headers[source.headerName] = source.headerValue;
   if (source.authMode === 'basic' && source.username) headers.Authorization = `Basic ${Buffer.from(`${source.username}:${source.password || ''}`).toString('base64')}`;
@@ -146,8 +158,17 @@ function runJsSnippet(code: string, context: Record<string, any>, timeout = 1000
     htmlFormat: (value: unknown) => he.decode(String(value ?? '')).replace(/<br\s*\/?/gi, '\n').replace(/<[^>]+>/g, ''),
   };
   const sandbox: Record<string, any> = { ...context, java, Buffer, JSON, String, Number, Math, Array, Object, console: { log: () => undefined } };
+  const body = code.replace(/^@js:/, '').trim();
   try {
-    const script = new vm.Script(`(function(){ ${code.replace(/^@js:/, '')}\n})()`);
+    const script = new vm.Script(`(function(){ ${body}\n})()`);
+    const result = script.runInNewContext(sandbox, { timeout });
+    const value = jsonPrimitiveToString(result ?? sandbox.result ?? '');
+    if (value) return value;
+  } catch {
+    // 如果 @js 后面是单个表达式（例如 header: @js:JSON.stringify({...})），上面的函数体不会自动返回。
+  }
+  try {
+    const script = new vm.Script(`(function(){ return (${body}); })()`);
     const result = script.runInNewContext(sandbox, { timeout });
     return jsonPrimitiveToString(result ?? sandbox.result ?? '');
   } catch {
@@ -186,7 +207,7 @@ function buildUrlFromTemplate(template: string, source: BookSource, keyword?: st
 
 function parseJsonMaybe(value: string): any | null {
   try {
-    return JSON.parse(value);
+    return JSON.parse(value.trim());
   } catch {
     return null;
   }
@@ -435,13 +456,15 @@ function applyLegadoIndexSelector(current: cheerio.Cheerio<any>, selector: strin
     const real = idx < 0 ? current.length + idx : idx;
     return { current: current.filter((index) => index !== real), selector: '' };
   }
-  const range = normalized.match(/\[(-?\d*):(-?\d*)(?::(-?\d+))?\]$/);
+  const range = normalized.match(/(?:\[(-?\d*):(-?\d*)(?::(-?\d+))?\]|\.(-?\d*):(-?\d*))$/);
   if (range) {
     normalized = normalized.slice(0, range.index).trim();
     current = normalized ? current.find(normalized) : current;
     const length = current.length;
-    const start = range[1] ? Number(range[1]) : 0;
-    const end = range[2] ? Number(range[2]) : length;
+    const startRaw = range[1] ?? range[4];
+    const endRaw = range[2] ?? range[5];
+    const start = startRaw ? Number(startRaw) : 0;
+    const end = endRaw ? Number(endRaw) : length;
     const realStart = start < 0 ? length + start : start;
     const realEnd = end < 0 ? length + end : end;
     return { current: current.slice(realStart, realEnd), selector: '' };
@@ -455,6 +478,33 @@ function applyLegadoIndexSelector(current: cheerio.Cheerio<any>, selector: strin
     return { current: current.eq(real), selector: '' };
   }
   return { current, selector: normalized };
+}
+
+function applyLegadoSelector($: cheerio.CheerioAPI, current: cheerio.Cheerio<any>, selector: string): cheerio.Cheerio<any> {
+  const normalized = selector.trim();
+  if (!normalized) return current;
+  const textMatch = normalized.match(/^text\.(.+)$/);
+  if (textMatch) {
+    const keyword = textMatch[1].trim();
+    const links = current.find('a[href]').filter((_, el) => $(el).text().includes(keyword));
+    if (links.length > 0) return links;
+    return current.find('button,span,div,p,li,a').filter((_, el) => $(el).text().includes(keyword));
+  }
+  const tokens = normalized.split(/\s+/).filter(Boolean);
+  if (
+    tokens.length > 1
+    && tokens.every((token) => !/[>+~]/.test(token))
+    && tokens.some((token) => /(?:\[!?\-?\d+\]|\[-?\d*:|-?\d+\]$|\.-?\d+(?::\-?\d*)?)$/.test(token))
+  ) {
+    let next = current;
+    for (const token of tokens) {
+      const indexed = applyLegadoIndexSelector(next, token);
+      next = indexed.selector ? next.find(indexed.selector) : indexed.current;
+    }
+    return next;
+  }
+  const indexed = applyLegadoIndexSelector(current, normalized);
+  return indexed.selector ? current.find(indexed.selector) : indexed.current;
 }
 
 function selectElements($: cheerio.CheerioAPI, root: cheerio.Cheerio<any>, rule?: string): cheerio.Cheerio<any> {
@@ -472,8 +522,7 @@ function selectElements($: cheerio.CheerioAPI, root: cheerio.Cheerio<any>, rule?
       current = current.children();
       continue;
     }
-    const indexed = applyLegadoIndexSelector(current, selector);
-    current = indexed.selector ? current.find(indexed.selector) : indexed.current;
+    current = applyLegadoSelector($, current, selector);
   }
   if (reverse) current = $(current.toArray().reverse());
   return current;
@@ -523,6 +572,12 @@ function selectXPath($: cheerio.CheerioAPI, root: cheerio.Cheerio<any>, rule: st
 function readValue($: cheerio.CheerioAPI, root: cheerio.Cheerio<any>, rule?: string, baseUrl?: string): string {
   for (const alternative of splitAlternatives(rule)) {
     const normalized = stripFilters(alternative);
+    const getMatch = normalized.match(/^@get:\s*\{\s*([A-Za-z0-9_$-]+)\s*\}$/);
+    if (getMatch) {
+      const value = jsonPrimitiveToString(variableStore.get(getMatch[1]));
+      if (value) return value;
+      continue;
+    }
     if (/^@?XPath:/i.test(normalized) || normalized.startsWith('//')) {
       const { nodes, attr, value: xpathValue } = selectXPath($, root, normalized);
       const node = nodes.first();
@@ -540,8 +595,7 @@ function readValue($: cheerio.CheerioAPI, root: cheerio.Cheerio<any>, rule?: str
       if (parsed.selector) {
         if (/^children$/i.test(parsed.selector)) current = current.children();
         else {
-          const indexed = applyLegadoIndexSelector(current, parsed.selector);
-          current = indexed.selector ? current.find(indexed.selector) : indexed.current;
+          current = applyLegadoSelector($, current, parsed.selector);
         }
       }
       if (parsed.attr) attr = parsed.attr;
@@ -578,8 +632,7 @@ function readValues($: cheerio.CheerioAPI, root: cheerio.Cheerio<any>, rule?: st
       if (parsed.selector) {
         if (/^children$/i.test(parsed.selector)) current = current.children();
         else {
-          const indexed = applyLegadoIndexSelector(current, parsed.selector);
-          current = indexed.selector ? current.find(indexed.selector) : indexed.current;
+          current = applyLegadoSelector($, current, parsed.selector);
         }
       }
       if (parsed.attr) attr = parsed.attr;
@@ -604,6 +657,19 @@ function readValues($: cheerio.CheerioAPI, root: cheerio.Cheerio<any>, rule?: st
     if (values.length > 0) return values;
   }
   return [];
+}
+
+function applyBookInfoInit($: cheerio.CheerioAPI, root: cheerio.Cheerio<any>, initRule?: string, baseUrl?: string) {
+  const putMatch = (initRule || '').match(/@put:\s*\{([\s\S]*)\}\s*$/);
+  if (!putMatch) return;
+  const body = putMatch[1];
+  const entryRegex = /([A-Za-z0-9_$-]+)\s*:\s*"((?:\\.|[^"\\])*)"/g;
+  let match: RegExpExecArray | null;
+  while ((match = entryRegex.exec(body)) !== null) {
+    const key = match[1];
+    const selector = match[2].replace(/\\"/g, '"').replace(/\\n/g, '\n');
+    variableStore.set(key, readValue($, root, selector, baseUrl));
+  }
 }
 
 function applyContentJsRule(value: string, jsRule: string): string {
@@ -648,6 +714,18 @@ function cleanContent(value: string) {
     .map((line) => line.trim())
     .filter(Boolean)
     .join('\n\n');
+}
+
+function chapterPageStem(url: string) {
+  try {
+    const parsed = new URL(url);
+    parsed.hash = '';
+    parsed.search = '';
+    parsed.pathname = parsed.pathname.replace(/_\d+(?=\.html?$)/i, '');
+    return parsed.toString();
+  } catch {
+    return url.replace(/_\d+(?=\.html?(?:[?#]|$))/i, '');
+  }
 }
 
 function proxyChapterImages(content: string, source: BookSource) {
@@ -784,7 +862,7 @@ async function fetchText(source: BookSource, url: string): Promise<string> {
   const request = splitUrlOptions(url);
   const safe = await validateProxyUrlServerSide(request.url);
   if (!safe) throw new Error(`书源地址未通过安全校验: ${request.url}`);
-  const cacheKey = `${LEGADO_CACHE_VERSION}|text|${source.id}|${request.method || 'GET'}|${request.url}|${request.body || ''}`;
+  const cacheKey = `text|${source.id}|${request.method || 'GET'}|${request.url}|${request.body || ''}`;
   const cached = textCache.get(cacheKey);
   const { cacheTTL } = await resolveLegadoConfig();
   if (cached && cached.expiresAt > Date.now()) return cached.data;
@@ -870,8 +948,18 @@ interface ExploreTarget {
   page: number;
 }
 
+function hasRuleBookList(rule?: LegadoRuleSearch) {
+  return !!rule?.bookList?.trim();
+}
+
+function getEffectiveExploreRule(rule: LegadoBookSourceRule): LegadoRuleSearch | undefined {
+  if (hasRuleBookList(rule.ruleExplore)) return rule.ruleExplore;
+  if (hasRuleBookList(rule.ruleSearch)) return rule.ruleSearch;
+  return undefined;
+}
+
 function hasExplore(rule: LegadoBookSourceRule) {
-  return rule.enabledExplore !== false && !!rule.exploreUrl && !!rule.ruleExplore?.bookList;
+  return rule.enabledExplore !== false && parseExploreUrl(rule.exploreUrl).length > 0 && !!getEffectiveExploreRule(rule);
 }
 
 function parseExploreUrl(exploreUrl?: string): Array<{ title: string; template: string }> {
@@ -939,7 +1027,7 @@ export class LegadoClient {
   async searchBooksSource(q: string, source: BookSource): Promise<{ source: BookSource; results: BookListItem[] }> {
     const rule = getRule(source);
     if (!rule.searchUrl || !rule.ruleSearch?.bookList) throw new Error('该 Legado 书源不支持搜索');
-    const cacheKey = `${LEGADO_CACHE_VERSION}|search|${source.id}|${q}`;
+    const cacheKey = `search|${source.id}|${q}`;
     const { cacheTTL } = await resolveLegadoConfig();
     const cached = searchCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) return { source, results: cached.data };
@@ -1067,7 +1155,7 @@ export class LegadoClient {
     }
     const targetUrl = buildExploreTargetUrl(source, target);
     const html = await fetchText(source, targetUrl);
-    const exploreRule = rule.ruleExplore || rule.ruleSearch;
+    const exploreRule = getEffectiveExploreRule(rule);
     const entries: BookListItem[] = [];
     let pageCount = 0;
     const json = parseJsonMaybe(html);
@@ -1148,7 +1236,7 @@ export class LegadoClient {
     const source = await getSourceById(sourceId);
     const rule = getRule(source);
     const detailHref = href || fallback?.detailHref || '';
-    const cacheKey = `${LEGADO_CACHE_VERSION}|detail|${source.id}|${detailHref}`;
+    const cacheKey = `detail|${source.id}|${detailHref}`;
     const { cacheTTL } = await resolveLegadoConfig();
     const cached = detailCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) return { ...cached.data, ...(!href && fallback ? fallback : {}) };
@@ -1161,6 +1249,7 @@ export class LegadoClient {
       const json = initData || parseJsonMaybe(html);
       const $ = json && initData ? null : json ? null : cheerio.load(html);
       const root = $?.root();
+      if ($ && root) applyBookInfoInit($, root, (rule.ruleBookInfo as any).init || rule.bookInfoInit, targetUrl);
       const read = (itemRule?: string) => initData
         ? readRegexItem(initData, itemRule, targetUrl)
         : json
@@ -1214,7 +1303,7 @@ export class LegadoClient {
     const source = await getSourceById(sourceId);
     const rule = getRule(source);
     if (!rule.ruleToc?.chapterList) throw new Error('该 Legado 书源缺少目录规则');
-    const cacheKey = `${LEGADO_CACHE_VERSION}|toc|${source.id}|${tocHref}`;
+    const cacheKey = `toc|${source.id}|${tocHref}`;
     const { cacheTTL } = await resolveLegadoConfig();
     const cached = tocCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) return cached.data;
@@ -1275,7 +1364,7 @@ export class LegadoClient {
     const rule = getRule(source);
     if (!rule.ruleContent?.content) throw new Error('该 Legado 书源缺少正文规则');
     const targetUrl = normalizeUrl(sourceBase(source), chapterHref);
-    const cacheKey = `${LEGADO_CACHE_VERSION}|chapter|${source.id}|${targetUrl}`;
+    const cacheKey = `chapter|${source.id}|${targetUrl}`;
     const cached = chapterCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) return cached.data;
 
@@ -1290,6 +1379,7 @@ export class LegadoClient {
       const next = rule.ruleContent.nextContentUrl ? contentFromRule(html, rule.ruleContent.nextContentUrl, pageUrl) : '';
       const normalizedNext = next ? normalizeUrl(pageUrl, next) : '';
       if (!normalizedNext || normalizedNext === pageUrl || visited.has(normalizedNext)) break;
+      if (chapterPageStem(normalizedNext) !== chapterPageStem(targetUrl)) break;
       pageUrl = normalizedNext;
     }
     const rawContent = parts.join('\\n\\n');
@@ -1299,7 +1389,10 @@ export class LegadoClient {
       id: stableId(`${source.id}|${targetUrl}`),
       title: index >= 0 ? chapters[index].title : '',
       href: targetUrl,
-      content: proxyChapterImages(cleanContent(rule.ruleContent.sourceRegex ? applyRuleFilters(rawContent, [rule.ruleContent.sourceRegex, '']) : rawContent), source),
+      content: proxyChapterImages(cleanContent(applyRuleFilters(rawContent, [
+        ...(rule.ruleContent.sourceRegex ? [rule.ruleContent.sourceRegex, ''] : []),
+        ...((rule.ruleContent as any).replaceRegex ? splitRuleFilters((rule.ruleContent as any).replaceRegex).filters : []),
+      ])), source),
       previousHref: index > 0 ? chapters[index - 1].href : undefined,
       nextHref: index >= 0 && index + 1 < chapters.length ? chapters[index + 1].href : undefined,
     };

@@ -285,6 +285,7 @@ export default function MusicPage() {
   const [loadingMoreSearch, setLoadingMoreSearch] = useState(false);
   const [currentSong, setCurrentSong] = useState<Song | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [isBuffering, setIsBuffering] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [volume, setVolume] = useState(100);
@@ -660,6 +661,7 @@ export default function MusicPage() {
             setCurrentSongUrl(streamUrl);
 
             if (audioRef.current) {
+              setIsBuffering(true);
               audioRef.current.src = streamUrl;
               audioRef.current.addEventListener('loadedmetadata', restoreTime, { once: true });
               audioRef.current.load();
@@ -679,6 +681,7 @@ export default function MusicPage() {
             const data = await fetchPlayData(latestDbSong, platform, selectedQuality, true);
             if (data.success && data.data?.play?.directUrl && audioRef.current) {
               setCurrentSongUrl(data.data.play.directUrl);
+              setIsBuffering(true);
               audioRef.current.src = data.data.play.directUrl;
               audioRef.current.addEventListener('loadedmetadata', restoreTime, { once: true });
               audioRef.current.load();
@@ -1323,10 +1326,12 @@ export default function MusicPage() {
         setCurrentSongUrl(streamUrl);
 
         if (audioRef.current) {
+          setIsBuffering(true);
           audioRef.current.src = streamUrl;
           audioRef.current.load();
           audioRef.current.play().catch(err => {
             console.error('播放失败:', err);
+            setIsBuffering(false);
           });
           setIsPlaying(true);
         }
@@ -1372,10 +1377,12 @@ export default function MusicPage() {
           setCurrentSongUrl(data.data.play.directUrl);
 
           if (audioRef.current) {
+            setIsBuffering(true);
             audioRef.current.src = data.data.play.directUrl;
             audioRef.current.load();
             audioRef.current.play().catch(err => {
               console.error('播放失败:', err);
+              setIsBuffering(false);
             });
             setIsPlaying(true);
           }
@@ -1385,6 +1392,7 @@ export default function MusicPage() {
       }
     } catch (error) {
       console.error('播放失败:', error);
+      setIsBuffering(false);
     } finally {
       endResolving();
     }
@@ -1457,8 +1465,10 @@ export default function MusicPage() {
           });
         }
       } else {
+        setIsBuffering(true);
         audioRef.current.play().catch(err => {
           console.error('播放失败:', err);
+          setIsBuffering(false);
         });
         setIsPlaying(true);
       }
@@ -1612,6 +1622,7 @@ export default function MusicPage() {
             .catch((error) => {
               console.error('切换音质后播放失败:', error);
               setIsPlaying(false);
+              setIsBuffering(false);
             });
         } else {
           setIsPlaying(false);
@@ -1619,12 +1630,14 @@ export default function MusicPage() {
       };
 
       audio.pause();
+      setIsBuffering(true);
       audio.src = nextSongUrl;
       audio.addEventListener('loadedmetadata', resumeAfterMetadata, { once: true });
       audio.load();
       setIsPlaying(shouldResume);
     } catch (error) {
       console.error('切换音质失败:', error);
+      setIsBuffering(false);
       setToast({
         message: (error as Error).message || '切换音质失败',
         type: 'error',
@@ -1801,6 +1814,16 @@ export default function MusicPage() {
       }
     };
 
+    const handleBufferingStart = () => {
+      if (audio.src && !audio.ended) {
+        setIsBuffering(true);
+      }
+    };
+
+    const handleBufferingEnd = () => {
+      setIsBuffering(false);
+    };
+
     const handleDurationChange = () => {
       setDuration(audio.duration);
 
@@ -1830,6 +1853,7 @@ export default function MusicPage() {
       }
     };
     const handleEnded = () => {
+      setIsBuffering(false);
       if (playMode === 'single') {
         audio.currentTime = 0;
         audio.play();
@@ -1849,12 +1873,28 @@ export default function MusicPage() {
     };
 
     audio.addEventListener('timeupdate', handleTimeUpdate);
+    audio.addEventListener('loadstart', handleBufferingStart);
+    audio.addEventListener('waiting', handleBufferingStart);
+    audio.addEventListener('stalled', handleBufferingStart);
+    audio.addEventListener('canplay', handleBufferingEnd);
+    audio.addEventListener('canplaythrough', handleBufferingEnd);
+    audio.addEventListener('playing', handleBufferingEnd);
+    audio.addEventListener('pause', handleBufferingEnd);
+    audio.addEventListener('error', handleBufferingEnd);
     audio.addEventListener('loadedmetadata', handleLoadedMetadata);
     audio.addEventListener('durationchange', handleDurationChange);
     audio.addEventListener('ended', handleEnded);
 
     return () => {
       audio.removeEventListener('timeupdate', handleTimeUpdate);
+      audio.removeEventListener('loadstart', handleBufferingStart);
+      audio.removeEventListener('waiting', handleBufferingStart);
+      audio.removeEventListener('stalled', handleBufferingStart);
+      audio.removeEventListener('canplay', handleBufferingEnd);
+      audio.removeEventListener('canplaythrough', handleBufferingEnd);
+      audio.removeEventListener('playing', handleBufferingEnd);
+      audio.removeEventListener('pause', handleBufferingEnd);
+      audio.removeEventListener('error', handleBufferingEnd);
       audio.removeEventListener('loadedmetadata', handleLoadedMetadata);
       audio.removeEventListener('durationchange', handleDurationChange);
       audio.removeEventListener('ended', handleEnded);
@@ -1918,6 +1958,7 @@ export default function MusicPage() {
   // 进度条拖动
   const handleProgressChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const newTime = (parseFloat(e.target.value) / 100) * duration;
+    setCurrentTime(newTime);
     if (audioRef.current) {
       audioRef.current.currentTime = newTime;
     }
@@ -2002,6 +2043,7 @@ export default function MusicPage() {
   };
 
   const progress = duration > 0 ? (currentTime / duration) * 100 : 0;
+  const showStreamBuffering = Boolean(currentSong && isBuffering);
 
   const toggleSpectrum = () => {
     setShowSpectrum(prev => !prev);
@@ -2266,6 +2308,92 @@ export default function MusicPage() {
             transform: translateY(-8px);
             opacity: 1;
           }
+        }
+        @keyframes music-buffer-scan {
+          0% {
+            transform: translateX(-100%);
+          }
+          100% {
+            transform: translateX(200%);
+          }
+        }
+        @keyframes music-buffer-stripes {
+          0% {
+            background-position: 0 0;
+          }
+          100% {
+            background-position: 24px 0;
+          }
+        }
+        .music-buffer-track {
+          background-image: repeating-linear-gradient(
+            115deg,
+            rgba(16, 185, 129, 0.08) 0,
+            rgba(16, 185, 129, 0.08) 6px,
+            rgba(110, 231, 183, 0.28) 6px,
+            rgba(110, 231, 183, 0.28) 12px
+          );
+          background-size: 24px 100%;
+          animation: music-buffer-stripes 0.65s linear infinite;
+        }
+        .music-buffer-track::before {
+          content: '';
+          position: absolute;
+          inset: 0;
+          width: 42%;
+          background: linear-gradient(
+            90deg,
+            transparent,
+            rgba(167, 243, 208, 0.95),
+            transparent
+          );
+          filter: drop-shadow(0 0 8px rgba(52, 211, 153, 0.7));
+          animation: music-buffer-scan 0.95s ease-in-out infinite;
+        }
+      `}</style>
+      <style jsx global>{`
+        @keyframes music-buffer-scan-global {
+          0% {
+            transform: translateX(-120%);
+          }
+          100% {
+            transform: translateX(260%);
+          }
+        }
+        @keyframes music-buffer-stripes-global {
+          0% {
+            background-position: 0 0;
+          }
+          100% {
+            background-position: 28px 0;
+          }
+        }
+        .music-buffer-track-global {
+          background-image: repeating-linear-gradient(
+            115deg,
+            rgba(16, 185, 129, 0.1) 0,
+            rgba(16, 185, 129, 0.1) 7px,
+            rgba(110, 231, 183, 0.34) 7px,
+            rgba(110, 231, 183, 0.34) 14px
+          );
+          background-size: 28px 100%;
+          animation: music-buffer-stripes-global 0.55s linear infinite;
+        }
+        .music-buffer-track-global::before {
+          content: '';
+          position: absolute;
+          top: 0;
+          bottom: 0;
+          left: 0;
+          width: 45%;
+          background: linear-gradient(
+            90deg,
+            transparent,
+            rgba(236, 253, 245, 0.95),
+            transparent
+          );
+          box-shadow: 0 0 12px rgba(52, 211, 153, 0.9);
+          animation: music-buffer-scan-global 0.85s ease-in-out infinite;
         }
       `}</style>
       {resolvingCount > 0 && (
@@ -2729,9 +2857,12 @@ export default function MusicPage() {
             {/* Progress Bar */}
             <div className="absolute left-0 right-0 top-0 h-1 bg-white/10 rounded-t-xl overflow-hidden">
               <div
-                className="h-full bg-green-500 transition-all pointer-events-none"
+                className="relative z-10 h-full bg-green-500 transition-all pointer-events-none"
                 style={{ width: `${progress}%` }}
               />
+              {showStreamBuffering && (
+                <div className="music-buffer-track-global absolute inset-0 z-0" />
+              )}
               <input
                 type="range"
                 min="0"
@@ -2766,7 +2897,15 @@ export default function MusicPage() {
                   )}
                 </div>
                 <div className="min-w-0">
-                  <div className="text-sm font-bold text-white truncate">{currentSong.name}</div>
+                  <div className="flex items-center gap-2">
+                    <div className="text-sm font-bold text-white truncate">{currentSong.name}</div>
+                    {showStreamBuffering && (
+                      <span className="hidden sm:inline-flex items-center gap-1 rounded-full bg-green-500/15 px-2 py-0.5 text-[10px] font-medium text-green-300">
+                        <span className="h-2 w-2 rounded-full bg-green-400 animate-pulse" />
+                        缓冲中
+                      </span>
+                    )}
+                  </div>
                   <div className="text-xs text-zinc-500 truncate">{currentSong.artist}</div>
                 </div>
               </div>
@@ -3169,9 +3308,17 @@ export default function MusicPage() {
               </div>
 
               {/* 进度条 */}
-              <div>
+              <div className="relative">
+                {showStreamBuffering && (
+                  <div className="pointer-events-none absolute left-0 top-0 z-10 -translate-y-full">
+                    <span className="inline-flex items-center gap-1 rounded-full bg-green-500/15 px-2 py-0.5 text-[10px] font-medium text-green-300">
+                      <span className="h-2 w-2 rounded-full bg-green-400 animate-pulse" />
+                      缓冲中
+                    </span>
+                  </div>
+                )}
                 {showSpectrum && (
-                  <div className="mb-3 flex items-center gap-2 text-xs">
+                  <div className="relative mb-3 flex items-center gap-2 text-xs">
                     <span className="invisible">{formatTime(currentTime)}</span>
                     <div className="flex-1">
                       <AudioSpectrumCanvas bars={spectrumBars} />
@@ -3183,9 +3330,12 @@ export default function MusicPage() {
                   <span>{formatTime(currentTime)}</span>
                   <div className="flex-1 h-1 bg-white/10 rounded-full overflow-hidden relative">
                     <div
-                      className="h-full bg-green-500 transition-all pointer-events-none"
+                      className="relative z-10 h-full bg-green-500 transition-all pointer-events-none"
                       style={{ width: `${progress}%` }}
                     />
+                    {showStreamBuffering && (
+                      <div className="music-buffer-track-global absolute inset-0 z-0" />
+                    )}
                     <input
                       type="range"
                       min="0"

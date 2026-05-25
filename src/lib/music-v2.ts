@@ -215,7 +215,7 @@ async function lxFetch(path: string, init: RequestInit = {}, authMode: LxFetchAu
   const response = await fetch(`${baseUrl}${path}`, {
     ...init,
     headers,
-    signal: AbortSignal.timeout(15000),
+    signal: AbortSignal.timeout(45000),
     cache: 'no-store',
   });
 
